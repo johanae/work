@@ -24,7 +24,7 @@ TODO: Make an assert function and some assert data if at all possible.
 #include "readutility.h"
 #include "common.h"
 
-void readAndPrepareData(char *filename, int numpart, TetgenMesh *M, int **partsizes_ptr, int **separatorsizes_ptr);
+void readAndPrepareData(char *filename, int numprocs, TetgenMesh *M, int **partsizes_ptr, int **separatorsizes_ptr);
 
 void writeToFile(TetgenMesh *M, char *filename);
 
@@ -36,71 +36,120 @@ void writeToFile(TetgenMesh *M, char *filename);
 * Pending said improvements, idea is currently to make a sort-perm, from which you make a giftlist, deleting duplicates
 * as you go.
 
+* The sending is done via three allToAlls--first send/recv sizes, then the send/recvlists, then the actual nodes.
+
 sortnodes is probably a misleading name.
 */
-void sortnodes(int n, int numnodes, int *elements, double *nodes, int *nodelimits, int numpart, int myrank) {
+void sortnodes(int n, int numnodes, int *elements, double **nodes_ptr, int *nodelimits, int numprocs, int myrank) {
 
     int i, j, uniques, count, min, max;
     int *perm, *invperm;
-    int *wishlist_sizes = (int *)calloc(numpart * sizeof(int), sizeof(int));
-    int *giftlist_sizes;
+    int *wishlist, *wishlist_sizes, *wishlist_disps, *giftlist, *giftlist_sizes, *giftlist_disps;
     double *sendnodes, *recvnodes;
-    double *nodes_result;
+    double *nodes, *nodes_result;
+
+    nodes = *nodes_ptr;
 
     perm = malloc(4 * n * sizeof(int));
     for (i = 0; i < 4 * n; i ++) perm[i] = i;
 
     quicksortPerm(elements, perm, 0, 4 * n);
 
-    invperm = malloc(4 * n * sizeof(int));
-    for (i = 0; i < 4 * n; i ++) invperm[perm[i]] = i;
+
+    wishlist_sizes = (int *)calloc((numprocs + 1) * sizeof(int), sizeof(int));
+    wishlist_disps = (int *)malloc((numprocs  + 1)* sizeof(int));
 
     int currentpart = uniques = 0;
-    i = -1;
-    while (++i < 4 * n) {
+    wishlist_disps[0] = 0;
+    for (i = 0; i < 4 * n; i ++) {
         if (i != 0 && (elements[perm[i]] == elements[perm[i - 1]])) continue;
 
-        if (elements[perm[i]] >= nodelimits[currentpart + 1]) currentpart ++;
+        if (elements[perm[i]] >= nodelimits[currentpart + 1]) {
+            wishlist_disps[++currentpart] = wishlist_disps[currentpart - 1] + wishlist_sizes[currentpart - 1];
+        }
 
         uniques ++;
         wishlist_sizes[currentpart] ++;
 
     }
 
-    int *global2local_elemts = malloc(uniques * sizeof(int));    // local relabelling essentially
-    int *local2global_elemts = malloc(uniques * sizeof(int));
-    i = -1; count = 0;
-    while (++i < 4 * n) {
+
+    //printf("%d\n", wishlist_sizes[myrank]);
+
+    for (i = currentpart + 1; i <= numprocs; i ++) {
+        wishlist_sizes[i] = 0;
+        wishlist_disps[i] = wishlist_disps[i - 1] + wishlist_sizes[i - 1];
+    }
+
+    wishlist = (int *)malloc(wishlist_disps[numprocs] * sizeof(int));
+    giftlist_sizes = (int *)malloc(numprocs * sizeof(int));
+    giftlist_disps = (int *)malloc((numprocs + 1) * sizeof(int));
+
+    count = 0;
+    for (i = 0; i < 4 * n; i ++) {
 
         if (i != 0 && (elements[perm[i]] == elements[perm[i - 1]])) continue;
 
-        global2local_elemts[count] = elements[perm[i]];
-        local2global_elemts[count] = invperm[global2local_elemts[count ++]];
+        wishlist[count++] = elements[perm[i]];
 
     }
 
-    if (myrank == 0) for (i = 0; i < uniques; i ++) printf("global2local: %d, local2global_elemts: %d.\n", global2local_elemts[i], local2global_elemts[i]);
-    // Step 1: Sort the elts, [012345...].
-    // Step 2: Give the elts local names.
-    // Step 3: Compute the global names.
-    // The permutation is bijective on the partition, but not globally.
-    // Consider what you have. global2local_elemts[0, 1, ...] gives the SORTED
-
-    giftlist_sizes = (int *)malloc(numpart * sizeof(int));
+    // Send wishlists, receive giftlists. Keep in mind, then: for proc i wishlist[j] = giftlist[i] on proc j.
     MPI_Alltoall(wishlist_sizes, 1, MPI_INT, giftlist_sizes, 1, MPI_INT, MPI_COMM_WORLD);
 
-    if (myrank == 0) for (i = 0; i < nodelimits[1]; i ++) printf("%d\n", global2local_elemts[i]);
+    giftlist_disps[0] = 0;
+    for (i = 1; i <= numprocs; i ++) {
+        giftlist_disps[i] = giftlist_disps[i - 1] + giftlist_sizes[i - 1];
+    }
 
-    /*// Verify symmetry
-    for (i = 0; i < numpart; i ++) {
-        printf("I am process %d and %d requests this many of my elements: %d.\n", myrank, i, giftlist_sizes[i]);
-        printf("I am process %d and from %d I request this many elements: %d.\n", myrank, i, wishlist_sizes[i]);
-    }*/
+    giftlist = (int *)malloc(giftlist_disps[numprocs] * sizeof(int));
 
+    MPI_Alltoallv(wishlist, wishlist_sizes, wishlist_disps, MPI_INT, giftlist, giftlist_sizes, giftlist_disps, MPI_INT, MPI_COMM_WORLD);
 
-    // Reminder: nodes currently require their UNSORTED LOCAL names for proper access, but require UNSORTED GLOBAL names for access.
-    // SORTED GLOBAL is a nonsense term. Don't use it. The wishlist consists of UNSORTED GLOBAL names.
-    //nodes_result = (double *)3 * uniques * sizeof(double);
+    sendnodes = (double *)malloc(3 * giftlist_disps[numprocs] * sizeof(double));
+
+    printf("proc %d sending %d nodes.\n", myrank, giftlist_disps[numprocs] - giftlist_disps[myrank]);
+    printf("proc %d has %d out of %d nodes.\n", myrank, nodelimits[myrank + 1] - nodelimits[myrank], nodelimits[numprocs]);
+
+    // retrieve nodes
+    sendnodes = (double *)malloc(3 * giftlist_disps[numprocs] * sizeof(double));
+    int shift =3 * nodelimits[myrank];
+    printf("Proc %d shift: %d\n", myrank, shift);
+    for (i = 0; i < numprocs; i ++) {
+
+        for (j = giftlist_disps[i]; j < giftlist_disps[i + 1]; j ++) {
+
+            sendnodes[3 * j] = nodes[3 * giftlist[j] - shift];
+            sendnodes[3 * j + 1] = nodes[3 * giftlist[j]  - shift + 1];
+            sendnodes[3 * j + 2] = nodes[3 * giftlist[j]  - shift + 2];
+        }
+    }
+
+    for (i = 0; i <= numprocs; i ++) {
+        giftlist_sizes[i] *= 3;
+        giftlist_disps[i] *= 3;
+        wishlist_sizes[i] *= 3;
+        wishlist_disps[i] *= 3;
+    }
+
+    // rename the nodes
+    for (i = 0; i < 4 * n; i ++) {
+
+        //elements[i] = invperm[elements[i]]; // I mean, something like this?
+    }
+
+    recvnodes = (double *)malloc(wishlist_disps[numprocs] * sizeof(double));
+    MPI_Alltoallv(sendnodes, giftlist_sizes, giftlist_disps, MPI_DOUBLE, recvnodes, wishlist_sizes, wishlist_disps, MPI_DOUBLE, MPI_COMM_WORLD);
+
+    // TODO: rename nodes
+
+    free(giftlist_disps);
+    free(giftlist_sizes);
+    free(wishlist_sizes);
+    free(wishlist_disps);
+    // Heavens, that felt good.
+
+    *nodes_ptr = recvnodes;
 
 }
 
@@ -133,12 +182,11 @@ int main(int narg, char **args) {
 
     if (myrank == 0) {
         char *filename = args[1];
-        int numpart = numprocs;
         M = (TetgenMesh *)malloc(sizeof(TetgenMesh));
 
-        readAndPrepareData(filename, numpart, M, &partsizes, &separatorsizes);
+        readAndPrepareData(filename, numprocs, M, &partsizes, &separatorsizes);
 
-        /* For use in MPI_Scatterv, here are all the size arrays and disp arrays required by process 0. Redundancies ahoy! */
+        // For use in MPI_Scatterv, here are all the size arrays and disp arrays required by process 0. Redundancies ahoy!
         xadjsizes = (int *) malloc(numprocs * sizeof(int));
         xadjdisps = (int *) malloc((numprocs + 1) * sizeof(int));
 
@@ -148,9 +196,11 @@ int main(int narg, char **args) {
             xadjsizes[i] = partsizes[i];
             xadjdisps[i] = xadjdisps[i - 1] + xadjsizes[i - 1];
         }
-        xadjdisps[numprocs] = M->n; // so, yeah. I don't remember what this was for. Find this out.
+        xadjdisps[numprocs] = M->n;
 
-        xadjs = M->xadj;
+        xadjs = malloc((M->n + 1) * sizeof(int));
+        memcpy(xadjs, M->xadj, (M->n + 1) * sizeof(int));
+        //xadjs = M->xadj;
         for (i = 1; i < numprocs; i ++) {
 
             int shift = M->xadj[xadjdisps[i]];
@@ -181,8 +231,8 @@ int main(int narg, char **args) {
 
         numnodes = M->numnodes;
 
-        nodesizes = (int *)malloc(numprocs * sizeof(int));
-        nodedisps = (int *)malloc(numprocs * sizeof(int));
+        nodesizes = (int *)malloc((numprocs + 1) * sizeof(int));
+        nodedisps = (int *)malloc((numprocs + 1) * sizeof(int));
 
         int incr;
         int q = numnodes / numprocs;
@@ -194,11 +244,9 @@ int main(int narg, char **args) {
         for (i = 1; i <= numprocs; i ++) {
             incr = q;
             if (i < r) incr ++;
-            //nodesizes[i] = 3 * q;
-            //if (i < r) nodesizes[i] += 3;
+
             nodesizes[i] = 3 * incr;
             nodedisps[i] = nodedisps[i - 1] + nodesizes[i - 1];
-            printf("%d\n", incr);
             nodelimits[i] = nodelimits[i - 1] + incr;
 
         }
@@ -222,41 +270,56 @@ int main(int narg, char **args) {
     MPI_Bcast(&numnodes, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(limits, numprocs + 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(nodelimits, numprocs + 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    printf("Process %d local_n %d\n", myrank, local_n);
+    if (myrank == 0) {printf("Basic data successfully transmitted.\n"); fflush(stdout);}
 
     // No packaging or anything is performed here, I just want to get the sending out of the way.
-
     local_xadj = (int *)malloc((local_n + 1) * sizeof(int));
     local_xadj[0] = 0;
     recvsize = local_n;
 
     MPI_Scatterv(&xadjs[1], xadjsizes, xadjdisps, MPI_INT, &local_xadj[1], recvsize, MPI_INT, 0, MPI_COMM_WORLD);
+    if (myrank == 0) {printf("xadj data successfully transmitted.\n"); fflush(stdout);}
 
     local_adjncy = (int *)malloc(local_xadj[local_n] * sizeof(int));
     recvsize = local_xadj[local_n];
     MPI_Scatterv(adjncy, adjncysizes, adjncydisps, MPI_INT, local_adjncy, recvsize, MPI_INT, 0, MPI_COMM_WORLD);
+    if (myrank == 0)  {printf("adjncy data successfully transmitted.\n"); fflush(stdout);}
 
     local_elemts = (int *)malloc(4 * local_n * sizeof(int));
     recvsize = 4 * local_n;
     MPI_Scatterv(elem, elemsizes, elemdisps, MPI_INT, local_elemts, recvsize, MPI_INT, 0, MPI_COMM_WORLD);
-    printf("Process %d has received local_elemts array of size %d.\n", myrank, recvsize);
-    printf("Limits[%d+1]: %d\n", myrank, limits[myrank+1]);
-    printf("Nodelimits[%d+1]: %d\n", myrank, nodelimits[myrank+1]);
+    if (myrank == 0)  {printf("elements data successfully transmitted.\n"); fflush(stdout);}
+    //printf("Process %d has received local_elemts array of size %d.\n", myrank, recvsize);
+    //printf("Limits[%d+1]: %d\n", myrank, limits[myrank+1]);
+    //printf("Nodelimits[%d+1]: %d\n", myrank, nodelimits[myrank+1]);
 
     local_numnodes = numnodes / numprocs;
     if (myrank < numnodes % numprocs) local_numnodes ++;
     recvsize = 3 * local_numnodes;
     local_nodes = (double *)malloc(3 * local_numnodes * sizeof(double));
     MPI_Scatterv(nodes, nodesizes, nodedisps, MPI_DOUBLE, local_nodes, recvsize, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if (myrank == 0)  {printf("nodes data successfully transmitted.\n"); fflush(stdout);}
 
-    sortnodes(local_n, local_numnodes, local_elemts, nodes, nodelimits, numprocs, myrank);
+    sortnodes(local_n, local_numnodes, local_elemts, &local_nodes, nodelimits, numprocs, myrank);
+    if (myrank == 0) {printf("All nodes data successfully rearranged, transmitted.\n"); fflush(stdout);}
 
     if (myrank == 0) {
-        deallocateTetgenMesh(M);
+        free(xadjsizes);
+        free(xadjdisps);
+        free(adjncysizes);
+        free(adjncydisps);
+        free(elemsizes);
+        free(elemdisps);
+        free(nodesizes);
+        free(nodedisps);
         free(partsizes);
         free(separatorsizes);
+
+        deallocateTetgenMesh(M);
     }
+
+    free(limits);
+    free(nodelimits);
 
     MPI_Finalize();
 }
