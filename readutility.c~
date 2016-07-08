@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "readutility.h"
 
 void swap(int *a, int *b) {
@@ -29,10 +30,46 @@ void quicksortPerm(int *arr, int *perm, int beg, int end) {
 }
 
 void deallocateTetgenMesh(TetgenMesh *M) {
-    
+
     free(M->xadj);
     free(M->adjncy);
     free(M->elements);
     free(M->nodes);
     free(M);
 }
+
+void ell2csr(int n, int *ell, int **xadj_ptr, int **adjncy_ptr) {
+
+    int *xadj, *adjncy;
+
+    *xadj_ptr = xadj = malloc((n + 1) * sizeof(int));
+    xadj[0] = 0;
+
+    int sum = 0;
+    for (int i = 0; i < n; i ++) {
+        for (int j = 0; j < 4; j ++) {
+            if (ell[4 * i + j] != -1) sum ++;
+        }
+        xadj[i + 1] = sum;
+    }
+    
+    *adjncy_ptr = adjncy = malloc(sum * sizeof(int));
+
+    int k = 0;
+    for (int i = 0; i < n; i ++) {
+        for (int j = 0; j < 4; j ++) {
+            if (ell[4 * i + j] != -1) adjncy[xadj[i]] = ell[4 * i + j];
+        }
+    }
+}
+
+/*
+Identify process containing node #i.
+*/
+/*int sddMPI_getpart(int i, localparttype* L) {
+    int k=0;
+    while(i >= L->limits[k+1])
+        k++;
+    assert(k <= L->parts);
+    return(k);
+}*/
